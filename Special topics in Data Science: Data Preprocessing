@@ -1,0 +1,295 @@
+#########################Preprocessing.py#########################
+
+
+import pandas as pd
+import numpy as np
+from sklearn.preprocessing import LabelEncoder, scale
+from sklearn.impute import SimpleImputer
+from sklearn.ensemble import RandomForestRegressor
+import os
+
+
+def buildFeatures(working_dir, type, quarter):
+    """构建训练集、测试集特征"""
+    os.chdir(working_dir)
+    file_dir = os.path.join(os.getcwd(), type, 'x_' + type)
+
+    # get a quarter cust_avli data:季度有效客户，仅有cust_no
+    cust_avli_dir = os.path.join(file_dir, os.listdir(file_dir)[4])
+    cust_avli_quarter = pd.read_csv(os.path.join(cust_avli_dir, 'cust_avli_Q' + str(quarter) + '.csv'))
+
+    # get three months aum data:月末时点资产数据
+    aum_dir = os.path.join(file_dir, os.listdir(file_dir)[0])
+    aum_first_month = pd.read_csv(os.path.join(aum_dir, 'aum_m' + str(1 + 3 * (quarter - 1)) + '.csv'))
+    aum_second_month = pd.read_csv(os.path.join(aum_dir, 'aum_m' + str(2 + 3 * (quarter - 1)) + '.csv'))
+    aum_third_month = pd.read_csv(os.path.join(aum_dir, 'aum_m' + str(3 + 3 * (quarter - 1)) + '.csv'))
+    aum_all = [aum_first_month, aum_second_month, aum_third_month]
+    aum_result = aumProcessing(aum_first_month, aum_second_month, aum_third_month)
+
+    # get three months behavior data:月行为数据
+    behavior_dir = os.path.join(file_dir, os.listdir(file_dir)[1])
+    behavior_first_month = pd.read_csv(
+        os.path.join(behavior_dir, ''.join(['behavior_m', str(1 + 3 * (quarter - 1)), '.csv'])))
+    behavior_second_month = pd.read_csv(
+        os.path.join(behavior_dir, ''.join(['behavior_m', str(2 + 3 * (quarter - 1)), '.csv'])))
+    behavior_third_month = pd.read_csv(
+        os.path.join(behavior_dir, ''.join(['behavior_m', str(3 + 3 * (quarter - 1)), '.csv'])))
+    behavior_all = [behavior_first_month, behavior_second_month, behavior_third_month]
+    behavior_reslut = behaviorProcessing(behavior_first_month, behavior_second_month, behavior_third_month)
+
+    # get a quarter big event data:季度客户重大历史数据
+    stop_time = pd.to_datetime(['2020-04-01', '2019-7-01', '2019-10-01', '2020-01-01'])[quarter - 1]
+    big_event_dir = os.path.join(file_dir, os.listdir(file_dir)[2])
+    big_event_quarter = pd.read_csv(os.path.join(big_event_dir, 'big_event_Q' + str(quarter) + '.csv'),
+                                    low_memory=False)
+    big_event_result = bigEventProcessing(big_event_quarter, stop_time)
+
+    # get three months cunkuan data:月存款数据
+    cunkuan_dir = os.path.join(file_dir, os.listdir(file_dir)[3])
+    cunkuan_first_month = pd.read_csv(os.path.join(cunkuan_dir, 'cunkuan_m' + str(1 + 3 * (quarter - 1)) + '.csv'))
+    cunkuan_second_month = pd.read_csv(os.path.join(cunkuan_dir, 'cunkuan_m' + str(2 + 3 * (quarter - 1)) + '.csv'))
+    cunkuan_third_month = pd.read_csv(os.path.join(cunkuan_dir, 'cunkuan_m' + str(3 + 3 * (quarter - 1)) + '.csv'))
+    cunkuan_all = [cunkuan_first_month, cunkuan_second_month, cunkuan_third_month]
+    cunkuan_result = cunkuanProcessing(cunkuan_first_month, cunkuan_second_month, cunkuan_third_month)
+
+    # get a quarter cust_info data:季度客户信息
+    cust_info_dir = os.path.join(file_dir, os.listdir(file_dir)[5])
+    cust_info_quarter = pd.read_csv(os.path.join(cust_info_dir, 'cust_info_Q' + str(quarter) + '.csv'))
+    cust_info_result = custInfoProcessing(cust_info_quarter)  # 主要是设置缺失值
+
+    all_result = mergeAll([aum_result, behavior_reslut, big_event_result, cunkuan_result, cust_info_result])
+    # 删除完全缺失值I9、完全唯一值I7、几乎唯一值I12（只有一个不同取值农业）
+    extract_result = extractLabeledCust(cust_avli_quarter, all_result).drop(['I7', 'I9', 'I12'], axis=1)
+    extract_result = fillNewCust(extract_result, aum_all, behavior_all, cunkuan_all)
+    all_result.to_csv(''.join(['all_result_quarter_', str(quarter), '.csv']), index=False)
+    extract_result.to_csv(''.join(['extract_result_quarter_', str(quarter), '.csv']), index=False)
+    return extract_result  # 返回一个季度的带标签的客户特征
+
+
+def threeMonthsUnion(first_month, second_month, third_month):
+    """在三个月中有数据的客户记录，即并集"""
+    union = np.union1d(np.union1d(first_month['cust_no'], second_month['cust_no']),
+                       third_month['cust_no'])
+    union_series = pd.Series(union, name='cust_no')
+    union_first = pd.merge(union_series, first_month, on='cust_no', how='left')
+    union_second = pd.merge(union_series, second_month, on='cust_no', how='left')
+    union_third = pd.merge(union_series, third_month, on='cust_no', how='left')
+    return union_first, union_second, union_third
+
+
+def aumProcessing(first_month, second_month, third_month):
+    """对aum进行处理"""
+    # X9:季度末结构性存款余额   X10:季度末定期存款余额 X11:季度末活期存款余额  X12:季度末理财余额
+    # X13:季度末基金余额       X14:季度末资管余额     X15:季度末贷款余额     X16:季度末大额存单余额
+    # X17:结构性存款首末月变化额X18:定期存款首末月变化额X19:活期存款首末月变化额X20:理财首末月变化额
+    # X21:基金首末月变化额     X22:资管首末月变化额    X23:贷款首末月变化额   X24:大额存单首末月变化额
+    union_first, union_second, union_third = threeMonthsUnion(first_month, second_month, third_month)
+    columns = ['cust_no', 'X9', 'X10', 'X11', 'X12', 'X13', 'X14', 'X15', 'X16', 'X17', 'X18', 'X19', 'X20', 'X21',
+               'X22', 'X23', 'X24']
+    aum_aggregation = pd.DataFrame(index=range(union_first.shape[0]), columns=columns)
+    aum_aggregation['cust_no'] = union_first['cust_no']
+    for i in range(1, 9):
+        aum_aggregation['X' + str(i + 8)] = union_third['X' + str(i)]
+    for j in range(1, 9):
+        aum_aggregation['X' + str(j + 16)] = union_third['X' + str(j)] - union_first['X' + str(j)]
+    return aum_aggregation
+
+
+def behaviorProcessing(first_month, second_month, third_month):
+    # B7:季度内动账总和   B8:季度登录手机银行网银次数总和 B9:转账转入次数总和
+    # B10:转账转入金额总和B11:转账转出次数总和           B12:转账转出金额总和
+    union_first, union_second, union_third = threeMonthsUnion(first_month, second_month, third_month)
+    columns = ['cust_no', 'B7', 'B8', 'B9', 'B10', 'B11', 'B12']
+    behavior_aggregation = pd.DataFrame(index=range(union_first.shape[0]), columns=columns)
+    behavior_aggregation['B7'], behavior_aggregation['cust_no'] = union_third['B7'], union_third['cust_no']
+    for i in range(1, 6):
+        first, second, third = union_first['B' + str(i)], union_second['B' + str(i)], union_third['B' + str(i)]
+        behavior_aggregation['B' + str(i + 7)] = first + second + third  # 三个月相加
+    return behavior_aggregation
+
+
+def bigEventProcessing(quarter_data, stop_time):
+    """不产生新的数据，仅对数据进行变换"""
+    # 对于日期：2019年12月31日-该日期，精确到天，单位为年
+    # 对于转出他行最大一笔金额、他行转入最大一笔金额，保持不变
+    quarter_data = quarter_data.drop('E11', axis=1)  # 去除完全缺失的特征
+    # stop_time = datetime.datetime(year=2019, month=12, day=31)
+    print('设定的截止时间是：', stop_time)
+    for feature in quarter_data.columns[1:]:
+        if quarter_data.dtypes[feature] == 'object':
+            quarter_data[feature] = (stop_time - pd.to_datetime(quarter_data[feature])).map(
+                lambda x: x.total_seconds() / (3600 * 24 * 365))
+
+    quarter_data.loc[quarter_data['E18'] < 0, 'E18'] = np.nan  # 设置错误时间为nan
+    quarter_data.loc[quarter_data['E1'] > 50, 'E18'] = np.nan
+
+    return quarter_data
+
+
+def cunkuanProcessing(first_month, second_month, third_month):
+    # C3:季度存款产品金额 C4:季度存款产品个数
+    union_first, union_second, union_third = threeMonthsUnion(first_month, second_month, third_month)
+    cunkuan_aggregation = pd.DataFrame(index=range(union_first.shape[0]), columns=['cust_no', 'C3', 'C4'])
+    cunkuan_aggregation['cust_no'] = union_first['cust_no']
+    cunkuan_aggregation['C3'] = union_first['C1'] + union_second['C1'] + union_third['C1']
+    cunkuan_aggregation['C4'] = union_first['C2'] + union_second['C2'] + union_third['C2']
+    return cunkuan_aggregation
+
+
+def custInfoProcessing(quarter_data):
+    """将客户信息表中表示缺失值含义的字符串转化为nan"""
+    quarter_data.loc[quarter_data['I5'] == '未知', 'I5'] = np.nan
+    quarter_data.loc[quarter_data['I10'] == '未知', 'I10'] = np.nan
+    quarter_data.loc[quarter_data['I13'] == '未说明的婚姻状况', 'I13'] = np.nan
+    quarter_data.loc[quarter_data['I14'] == '未知', 'I14'] = np.nan
+    return quarter_data
+
+
+def mergeAll(forms):
+    all_result = forms[0]
+    for i in range(1, len(forms)):
+        all_result = pd.merge(all_result, forms[i], on='cust_no', how='outer')
+    return all_result
+
+
+def extractLabeledCust(labeled_cust_no, original_table):
+    """根据活跃用户表即有标签的用户表labeled_cust_no，从original_table中抓取"""
+    print('表中含有的客户数：', original_table.shape[0])
+    print('有标签的客户数：', labeled_cust_no.shape[0])
+    extraction = pd.merge(labeled_cust_no, original_table, on='cust_no', how='inner')
+    print('从表中抓取到的客户数：', extraction.shape[0])
+    return extraction
+
+
+def fillNewCust(extract_result, aum, behavior, cunkuan):
+    for table_list in [aum, behavior, cunkuan]:
+        for table in table_list:
+            table.set_index(["cust_no"], inplace=True)
+    print('改变index成功！')
+
+    for i in range(extract_result.shape[0]):
+        if np.isnan(extract_result.loc[i, 'X17']):
+            null_cust_no = extract_result.loc[i, 'cust_no']
+            for j in range(1, 9):
+                if null_cust_no in aum[1].index:
+                    extract_result.loc[i, 'X' + str(j + 16)] = aum[2].loc[null_cust_no, 'X' + str(j)] - \
+                                                               aum[1].loc[null_cust_no, 'X' + str(j)]
+                else:
+                    extract_result.loc[i, 'X' + str(j + 16)] = 0
+            for k in range(1, 6):
+                if null_cust_no in behavior[1].index:
+                    extract_result.loc[i, 'B' + str(k + 7)] = behavior[2].loc[null_cust_no, 'B' + str(k)] + \
+                                                              behavior[1].loc[null_cust_no, 'B' + str(k)]
+                else:
+                    extract_result.loc[i, 'B' + str(k + 7)] = behavior[2].loc[null_cust_no, 'B' + str(k)]
+            for m in range(1, 3):
+                if null_cust_no in cunkuan[1].index:
+                    extract_result.loc[i, 'C' + str(m + 2)] = cunkuan[2].loc[null_cust_no, 'C' + str(m)] + \
+                                                              cunkuan[1].loc[null_cust_no, 'C' + str(m)]
+                else:
+                    extract_result.loc[i, 'C' + str(m + 2)] = cunkuan[2].loc[null_cust_no, 'C' + str(m)]
+    for n in range(extract_result.shape[0]):
+        if np.isnan(extract_result.loc[n, 'C3']):
+            null_cust_no = extract_result.loc[n, 'cust_no']
+            for m in range(1, 3):
+                if null_cust_no in cunkuan[1].index:
+                    extract_result.loc[n, 'C' + str(m + 2)] = cunkuan[2].loc[null_cust_no, 'C' + str(m)] + \
+                                                              cunkuan[1].loc[null_cust_no, 'C' + str(m)]
+                elif null_cust_no not in cunkuan[1].index and null_cust_no in cunkuan[2].index:
+                    extract_result.loc[n, 'C' + str(m + 2)] = cunkuan[2].loc[null_cust_no, 'C' + str(m)]
+
+    return extract_result
+
+
+def missingValuesProcessing(data, embedding=True):
+    data = data.drop(['E7', 'E9', 'I13', 'cust_no'], axis=1)
+
+    for i in [2, 3, 4, 5, 6, 8, 10, 12, 13, 14, 16, 18]:
+        data['E' + str(i)] = data['E' + str(i)].fillna(999)
+    for j in [5, 10, 14]:
+        data['I' + str(j)] = data['I' + str(j)].fillna('missing')
+    imp = SimpleImputer(missing_values=np.nan, strategy='median')
+    data[['C3', 'C4']] = imp.fit_transform(data[['C3', 'C4']])
+    # data['C4'] = imp.fit_transform(data['C4'])
+    imp.set_params(**{'strategy': 'most_frequent'})
+    data['I1'] = imp.fit_transform(data['I1'].values.reshape(-1, 1))
+
+    le_list = []
+    for col in ['I3', 'I5', 'I8', 'I10', 'I14']:
+        le_col = LabelEncoder()
+        data[col] = le_col.fit_transform(data[col])
+        le_list.append(le_col)
+    data['I1'] = data['I1'].map({'女性': 0, '男性': 1})
+    data['I11'] = data['I11'].replace(0, np.nan)
+    columns = data.columns
+    feature_col = columns.drop('I11')
+    know_df = data[data['I11'].notna()]
+    unknow_df = data[data['I11'].isna()]
+    x = know_df[feature_col].values
+    y = know_df['I11'].values
+    rfr = RandomForestRegressor(random_state=0, n_estimators=2000, n_jobs=-1)
+    rfr.fit(x, y)
+    prediction = rfr.predict(unknow_df[feature_col])
+    data.loc[data['I11'].isna(), 'I11'] = prediction
+    if not embedding:
+        for col, le_col in zip(['I3', 'I5', 'I8', 'I10', 'I14'], le_list):
+            data[col] = le_col.inverse_transform(data[col])
+        data['I1'] = data['I1'].map({0: '女', 1: '男'})
+
+    return data
+
+
+def scaleNumericFeatures(data):
+    num_features = ['X' + str(i) for i in range(9, 25)] + ['B' + str(j) for j in range(7, 13)] + ['I2', 'I11']
+    num_features.extend(['E' + str(k) for k in range(1, 19)] + ['C3', 'C4'])
+    for remove_item in ['E7', 'E9', 'E11']:
+        num_features.remove(remove_item)
+    data[num_features] = scale(data[num_features], axis=0)
+    return data
+
+
+def loadData(working_dir, scale=False):
+    """特征变换、整合、删去唯一值、将表示缺失含义的string转化成缺失值"""
+    os.chdir(working_dir)
+    print(os.listdir(os.getcwd()))
+    if 'total_data.csv' in os.listdir(os.getcwd()):
+        data = pd.read_csv(os.path.join(os.getcwd(), 'total_data.csv'))
+        X_data = data.iloc[:, :-1]
+        y_data = data.iloc[:, -1]
+    else:
+        # 生成带标记的特征
+        train_file_name = ['extract_result_quarter_3.csv', 'extract_result_quarter_4.csv']
+        if set(train_file_name) <= set(os.listdir(os.getcwd())):
+            X_data_3 = pd.read_csv(os.path.join(os.getcwd(), train_file_name[0]))
+            X_data_4 = pd.read_csv(os.path.join(os.getcwd(), train_file_name[1]))
+        else:
+            X_data_3 = buildFeatures(r'F:\数据科学专题\competition', type='train', quarter=3)
+            X_data_4 = buildFeatures(r'F:\数据科学专题\competition', type='train', quarter=4)
+
+        X_data = missingValuesProcessing(pd.concat([X_data_3, X_data_4], axis=0))
+        if scale:
+            X_data = scaleNumericFeatures(X_data)
+        # 生成全部标记
+        y_data_3 = pd.read_csv(r'train\y_train\y_Q3_3.csv', usecols=[1])
+        y_data_4 = pd.read_csv(r'train\y_train\y_Q4_3.csv', usecols=[1])
+        y_data = pd.concat([y_data_3, y_data_4], axis=0)
+        # 将特征和标记合并输出
+        total_data = pd.concat([X_data, y_data], axis=1)
+        total_data.to_csv('total_data.csv', index=False)
+    # 生成测试特征
+    if 'X_test.csv' in os.listdir(os.getcwd()):
+        X_test = pd.read_csv(os.path.join(os.getcwd(), 'X_test.csv'))
+    else:
+        if 'extract_result_quarter_1.csv' in os.listdir(os.getcwd()):
+            X_test = pd.read_csv(os.path.join(os.getcwd(), 'extract_result_quarter_1.csv'))
+        else:
+            X_test = buildFeatures(r'F:\数据科学专题\competition', type='test', quarter=1)
+        X_test = missingValuesProcessing(X_test)
+        if scale:
+            X_test = scaleNumericFeatures(X_test)
+        X_test.to_csv('X_test.csv', index=False)
+    return X_data, y_data, X_test  # 返回带标记特征、标记、测试特征
+
+
+if __name__ == '__main__':
+    X_data, y_data, X_test = loadData(r'F:\数据科学专题\competition', True)
